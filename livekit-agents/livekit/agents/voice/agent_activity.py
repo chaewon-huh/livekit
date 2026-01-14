@@ -55,9 +55,11 @@ from .events import (
 from .generation import (
     ToolExecutionOutput,
     _AudioOutput,
+    _BufferedAudioOutput,
     _TextOutput,
     _TTSGenerationData,
     perform_audio_forwarding,
+    perform_buffered_audio_forwarding,
     perform_llm_inference,
     perform_text_forwarding,
     perform_tool_executions,
@@ -95,6 +97,21 @@ class _PreemptiveGeneration:
     created_at: float
 
 
+@dataclass
+class _SpeculativeGeneration:
+    """State for speculative LLM generation with delayed TTS playback."""
+
+    speech_handle: SpeechHandle
+    user_message: llm.ChatMessage
+    chat_ctx: llm.ChatContext
+    tools: list[llm.Tool | llm.Toolset]
+    tool_choice: llm.ToolChoice | None
+    created_at: float
+    end_of_speech_time: float
+    buffered_audio: _BufferedAudioOutput | None = None
+    playback_started: bool = False
+
+
 # NOTE: AgentActivity isn't exposed to the public API
 class AgentActivity(RecognitionHooks):
     def __init__(self, agent: Agent, sess: AgentSession) -> None:
@@ -128,6 +145,7 @@ class AgentActivity(RecognitionHooks):
         self._speech_tasks: list[asyncio.Task[Any]] = []
 
         self._preemptive_generation: _PreemptiveGeneration | None = None
+        self._speculative_generation: _SpeculativeGeneration | None = None
 
         self._drain_blocked_tasks: list[asyncio.Task[Any]] = []
         self._mcp_tools: list[mcp.MCPTool] = []
@@ -1218,6 +1236,24 @@ class AgentActivity(RecognitionHooks):
             self._false_interruption_timer.cancel()
             self._false_interruption_timer = None
 
+        # Cancel speculative generation if still in buffer period (before playback started)
+        if self._speculative_generation is not None:
+            spec = self._speculative_generation
+            tts_playback_delay = self._session.options.tts_playback_delay
+            if tts_playback_delay is None:
+                tts_playback_delay = self._session.options.min_endpointing_delay
+            speculative_delay = self._session.options.speculative_llm_delay or 0.0
+            if tts_playback_delay < speculative_delay:
+                tts_playback_delay = speculative_delay
+
+            elapsed = time.time() - spec.end_of_speech_time
+            if elapsed < tts_playback_delay and not spec.playback_started:
+                logger.debug(
+                    "user resumed speaking during speculative buffer period, discarding",
+                    extra={"elapsed_ms": elapsed * 1000},
+                )
+                self._cancel_speculative_generation()
+
     def on_end_of_speech(self, ev: vad.VADEvent | None) -> None:
         speech_end_time = time.time()
         if ev:
@@ -1349,6 +1385,68 @@ class AgentActivity(RecognitionHooks):
             tool_choice=self._tool_choice,
             created_at=time.time(),
         )
+
+    def on_speculative_trigger(
+        self, info: _PreemptiveGenerationInfo, end_of_speech_time: float
+    ) -> None:
+        """Called at speculative_llm_delay after END_OF_SPEECH to start speculative LLM+TTS.
+
+        The generated speech will be buffered and playback will start at tts_playback_delay.
+        If the user resumes speaking before playback starts, the speculative generation
+        is discarded.
+        """
+        if (
+            self._scheduling_paused
+            or (self._current_speech is not None and not self._current_speech.interrupted)
+            or not isinstance(self.llm, llm.LLM)
+        ):
+            return
+
+        # Cancel any existing speculative generation
+        self._cancel_speculative_generation()
+
+        user_message = llm.ChatMessage(
+            role="user",
+            content=[info.new_transcript],
+            transcript_confidence=info.transcript_confidence,
+        )
+
+        chat_ctx = self._agent.chat_ctx.copy()
+
+        # Start LLM+TTS generation but don't schedule playback yet
+        speech_handle = self._generate_reply(
+            user_message=user_message,
+            chat_ctx=chat_ctx,
+            schedule_speech=False,
+        )
+
+        self._speculative_generation = _SpeculativeGeneration(
+            speech_handle=speech_handle,
+            user_message=user_message,
+            chat_ctx=chat_ctx.copy(),
+            tools=self.tools.copy(),
+            tool_choice=self._tool_choice,
+            created_at=time.time(),
+            end_of_speech_time=end_of_speech_time,
+        )
+
+        logger.debug(
+            "started speculative generation",
+            extra={
+                "transcript": info.new_transcript,
+                "end_of_speech_time": end_of_speech_time,
+            },
+        )
+
+    def _cancel_speculative_generation(self) -> None:
+        """Cancel speculative generation and discard buffered audio."""
+        if self._speculative_generation is not None:
+            spec = self._speculative_generation
+            spec.speech_handle._cancel()
+            if spec.buffered_audio is not None:
+                spec.buffered_audio.cancelled = True
+            self._speculative_generation = None
+            logger.debug("cancelled speculative generation")
 
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition
@@ -1506,7 +1604,39 @@ class AgentActivity(RecognitionHooks):
             user_message.metrics = metrics_report
 
         speech_handle: SpeechHandle | None = None
-        if preemptive := self._preemptive_generation:
+
+        # Check speculative generation first (has priority over preemptive)
+        if speculative := self._speculative_generation:
+            # Validate that the speculative generation is still valid
+            if (
+                speculative.user_message.text_content == user_message.text_content
+                and speculative.chat_ctx.is_equivalent(temp_mutable_chat_ctx)
+                and speculative.tools == self.tools
+                and speculative.tool_choice == self._tool_choice
+            ):
+                speech_handle = speculative.speech_handle
+                speculative.user_message.metrics = metrics_report
+
+                # Schedule the speech - the buffered audio forwarding will handle timing
+                self._schedule_speech(speech_handle, priority=SpeechHandle.SPEECH_PRIORITY_NORMAL)
+                logger.debug(
+                    "using speculative generation",
+                    extra={"speculative_lead_time": time.time() - speculative.created_at},
+                )
+                if not self._session.output.audio_enabled:
+                    speculative.playback_started = True
+                    self._speculative_generation = None
+            else:
+                logger.warning(
+                    "speculative generation invalidated: chat context or tools changed"
+                )
+                speculative.speech_handle._cancel()
+                if speculative.buffered_audio is not None:
+                    speculative.buffered_audio.cancelled = True
+                self._speculative_generation = None
+
+        # Then check preemptive generation
+        if speech_handle is None and (preemptive := self._preemptive_generation):
             # make sure the on_user_turn_completed didn't change some request parameters
             # otherwise invalidate the preemptive generation
             if (
@@ -1670,7 +1800,7 @@ class AgentActivity(RecognitionHooks):
                 otel_context=speech_handle._agent_turn_context,
             )
 
-        audio_out: _AudioOutput | None = None
+        audio_out: _AudioOutput | _BufferedAudioOutput | None = None
         tts_gen_data: _TTSGenerationData | None = None
         if audio_output is not None:
             if audio is None:
@@ -1884,6 +2014,63 @@ class AgentActivity(RecognitionHooks):
                 tr_input = timed_texts
                 read_transcript_from_tts = True
 
+        started_speaking_at: float | None = None
+        stopped_speaking_at: float | None = None
+
+        def _on_first_frame(fut: asyncio.Future[float] | asyncio.Future[None]) -> None:
+            """
+            Callback to update the agent state when the first frame is captured:
+            1. _AudioOutput.first_frame_fut (float)
+            2. _TextOutput.first_text_fut (None)
+            """
+            nonlocal started_speaking_at
+            try:
+                started_speaking_at = fut.result() or time.time()
+            except BaseException:
+                return
+
+            self._session._update_agent_state(
+                "speaking",
+                start_time=started_speaking_at,
+                otel_context=speech_handle._agent_turn_context,
+            )
+
+        audio_out: _AudioOutput | _BufferedAudioOutput | None = None
+        speculative = self._speculative_generation
+        if (
+            audio_output is not None
+            and tts_gen_data is not None
+            and speculative is not None
+            and speculative.speech_handle is speech_handle
+        ):
+            playback_delay = self._session.options.tts_playback_delay
+            if playback_delay is None:
+                playback_delay = self._session.options.min_endpointing_delay
+            speculative_delay = self._session.options.speculative_llm_delay or 0.0
+            if playback_delay < speculative_delay:
+                playback_delay = speculative_delay
+
+            playback_delay_remaining = max(
+                (speculative.end_of_speech_time + playback_delay) - time.time(), 0.0
+            )
+            forward_task, buffered_out = perform_buffered_audio_forwarding(
+                audio_output=audio_output,
+                tts_output=tts_gen_data.audio_ch,
+                playback_delay_remaining=playback_delay_remaining,
+            )
+            speculative.buffered_audio = buffered_out
+            audio_out = buffered_out
+            tasks.append(forward_task)
+            audio_out.first_frame_fut.add_done_callback(_on_first_frame)
+
+            async def _mark_playback_started() -> None:
+                await buffered_out.playback_ready_event.wait()
+                if self._speculative_generation is speculative:
+                    speculative.playback_started = True
+                    self._speculative_generation = None
+
+            tasks.append(asyncio.create_task(_mark_playback_started()))
+
         wait_for_scheduled = asyncio.ensure_future(speech_handle._wait_for_scheduled())
         await speech_handle.wait_if_not_interrupted([wait_for_scheduled])
 
@@ -1937,29 +2124,7 @@ class AgentActivity(RecognitionHooks):
             )
             tasks.append(text_forward_task)
 
-        started_speaking_at: float | None = None
-        stopped_speaking_at: float | None = None
-
-        def _on_first_frame(fut: asyncio.Future[float] | asyncio.Future[None]) -> None:
-            """
-            Callback to update the agent state when the first frame is captured:
-            1. _AudioOutput.first_frame_fut (float)
-            2. _TextOutput.first_text_fut (None)
-            """
-            nonlocal started_speaking_at
-            try:
-                started_speaking_at = fut.result() or time.time()
-            except BaseException:
-                return
-
-            self._session._update_agent_state(
-                "speaking",
-                start_time=started_speaking_at,
-                otel_context=speech_handle._agent_turn_context,
-            )
-
-        audio_out: _AudioOutput | None = None
-        if audio_output is not None:
+        if audio_output is not None and audio_out is None:
             assert tts_gen_data is not None
             # TODO(theomonnom): should the audio be added to the chat_context too?
             forward_task, audio_out = perform_audio_forwarding(

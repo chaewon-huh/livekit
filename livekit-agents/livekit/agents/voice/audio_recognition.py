@@ -88,6 +88,9 @@ class RecognitionHooks(Protocol):
     def on_final_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None = None) -> None: ...
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool: ...
     def on_preemptive_generation(self, info: _PreemptiveGenerationInfo) -> None: ...
+    def on_speculative_trigger(
+        self, info: _PreemptiveGenerationInfo, end_of_speech_time: float
+    ) -> None: ...
 
     def retrieve_chat_ctx(self) -> llm.ChatContext: ...
 
@@ -564,15 +567,76 @@ class AudioRecognition:
                             }
                         )
 
-            extra_sleep = endpointing_delay
-            if last_speaking_time:
-                extra_sleep += last_speaking_time - time.time()
+            # Check if speculative generation is enabled
+            speculative_llm_delay = self._session.options.speculative_llm_delay
+            tts_playback_delay = self._session.options.tts_playback_delay
 
-            if extra_sleep > 0:
-                try:
-                    await asyncio.wait_for(self._closing.wait(), timeout=extra_sleep)
-                except asyncio.TimeoutError:
-                    pass
+            # Calculate base time offset from last speaking
+            time_offset = 0.0
+            if last_speaking_time:
+                time_offset = last_speaking_time - time.time()
+
+            if speculative_llm_delay is not None and speculative_llm_delay > 0:
+                # Two-phase delay: speculative trigger at phase 1, end_of_turn at phase 2
+                playback_delay = (
+                    tts_playback_delay
+                    if tts_playback_delay is not None
+                    else self._min_endpointing_delay
+                )
+                if playback_delay < speculative_llm_delay:
+                    logger.warning(
+                        "tts_playback_delay is less than speculative_llm_delay; "
+                        "clamping to speculative_llm_delay",
+                        extra={
+                            "tts_playback_delay": playback_delay,
+                            "speculative_llm_delay": speculative_llm_delay,
+                        },
+                    )
+                    playback_delay = speculative_llm_delay
+
+                # Phase 1: Wait for speculative_llm_delay then trigger speculative generation
+                phase1_sleep = speculative_llm_delay + time_offset
+                if phase1_sleep > 0:
+                    try:
+                        await asyncio.wait_for(self._closing.wait(), timeout=phase1_sleep)
+                    except asyncio.TimeoutError:
+                        pass
+
+                # Calculate end_of_speech_time for speculative generation
+                end_of_speech_time = (
+                    last_speaking_time if last_speaking_time else time.time() - speculative_llm_delay
+                )
+
+                # Trigger speculative generation
+                confidence_avg_spec = (
+                    sum(self._final_transcript_confidence) / len(self._final_transcript_confidence)
+                    if self._final_transcript_confidence
+                    else 0
+                )
+                self._hooks.on_speculative_trigger(
+                    _PreemptiveGenerationInfo(
+                        new_transcript=self._audio_transcript,
+                        transcript_confidence=confidence_avg_spec,
+                        started_speaking_at=speech_start_time,
+                    ),
+                    end_of_speech_time=end_of_speech_time,
+                )
+
+                # Phase 2: Wait remaining time until playback delay
+                phase2_sleep = playback_delay - speculative_llm_delay
+                if phase2_sleep > 0:
+                    try:
+                        await asyncio.wait_for(self._closing.wait(), timeout=phase2_sleep)
+                    except asyncio.TimeoutError:
+                        pass
+            else:
+                # Original single-phase delay
+                extra_sleep = endpointing_delay + time_offset
+                if extra_sleep > 0:
+                    try:
+                        await asyncio.wait_for(self._closing.wait(), timeout=extra_sleep)
+                    except asyncio.TimeoutError:
+                        pass
 
             confidence_avg = (
                 sum(self._final_transcript_confidence) / len(self._final_transcript_confidence)

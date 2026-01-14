@@ -90,6 +90,8 @@ class AgentSessionOptions:
     preemptive_generation: bool
     tts_text_transforms: Sequence[TextTransforms] | None
     ivr_detection: bool
+    speculative_llm_delay: float | None
+    tts_playback_delay: float | None
 
 
 Userdata_T = TypeVar("Userdata_T")
@@ -160,6 +162,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         tts_text_transforms: NotGivenOr[Sequence[TextTransforms] | None] = NOT_GIVEN,
         preemptive_generation: bool = False,
         ivr_detection: bool = False,
+        speculative_llm_delay: float | None = None,
+        tts_playback_delay: float | None = None,
         conn_options: NotGivenOr[SessionConnectOptions] = NOT_GIVEN,
         loop: asyncio.AbstractEventLoop | None = None,
         # deprecated
@@ -249,6 +253,15 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 Defaults to ``False``.
             ivr_detection (bool): Whether to detect if the agent is interacting with an IVR system.
                 Default ``False``.
+            speculative_llm_delay (float, optional): Time in seconds after VAD END_OF_SPEECH
+                to start speculative LLM generation. When set, the agent begins LLM inference
+                early while buffering TTS output until ``tts_playback_delay``. If the user
+                resumes speaking before playback starts, the speculative generation is discarded.
+                Set to ``None`` to disable. Default ``None``.
+            tts_playback_delay (float, optional): Time in seconds after VAD END_OF_SPEECH
+                to start TTS playback when speculative generation is enabled. Must be greater
+                than ``speculative_llm_delay``. Set to ``None`` to use ``min_endpointing_delay``.
+                Default ``None``.
             conn_options (SessionConnectOptions, optional): Connection options for
                 stt, llm, and tts.
             loop (asyncio.AbstractEventLoop, optional): Event loop to bind the
@@ -292,6 +305,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             use_tts_aligned_transcript=use_tts_aligned_transcript
             if is_given(use_tts_aligned_transcript)
             else None,
+            speculative_llm_delay=speculative_llm_delay,
+            tts_playback_delay=tts_playback_delay,
         )
         self._conn_options = conn_options or SessionConnectOptions()
         self._started = False

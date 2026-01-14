@@ -340,6 +340,157 @@ class _AudioOutput:
     """Future that will be set with the timestamp of the first frame's capture"""
 
 
+@dataclass
+class _BufferedAudioOutput:
+    buffer: list[rtc.AudioFrame]
+    first_frame_fut: asyncio.Future[float]
+    playback_ready_event: asyncio.Event
+    cancelled: bool = False
+    """Future that will be set with the timestamp of the first frame's capture"""
+
+
+def perform_buffered_audio_forwarding(
+    *,
+    audio_output: io.AudioOutput,
+    tts_output: AsyncIterable[rtc.AudioFrame],
+    playback_delay_remaining: float,
+) -> tuple[asyncio.Task[None], _BufferedAudioOutput]:
+    """Buffer TTS frames and delay playback by specified duration.
+
+    Args:
+        audio_output: The audio output to send frames to.
+        tts_output: The TTS output stream to read frames from.
+        playback_delay_remaining: Time in seconds to wait before starting playback.
+
+    Returns:
+        A tuple of (task, buffered_output). The buffered_output.cancelled flag can be
+        set to True to discard buffered frames and stop playback.
+    """
+    out = _BufferedAudioOutput(
+        buffer=[],
+        first_frame_fut=asyncio.Future(),
+        playback_ready_event=asyncio.Event(),
+    )
+    task = asyncio.create_task(
+        _buffered_audio_forwarding_task(audio_output, tts_output, out, playback_delay_remaining)
+    )
+    return task, out
+
+
+@utils.log_exceptions(logger=logger)
+async def _buffered_audio_forwarding_task(
+    audio_output: io.AudioOutput,
+    tts_output: AsyncIterable[rtc.AudioFrame],
+    out: _BufferedAudioOutput,
+    playback_delay_remaining: float,
+) -> None:
+    """Buffer TTS frames and release them after the delay period."""
+    resampler: rtc.AudioResampler | None = None
+    buffer_task: asyncio.Task[None] | None = None
+
+    async def _buffer_frames() -> None:
+        """Buffer incoming TTS frames until cancelled or stream ends."""
+        try:
+            async for frame in tts_output:
+                if out.cancelled:
+                    return
+                out.buffer.append(frame)
+        except asyncio.CancelledError:
+            pass
+
+    def _on_playback_started(ev: io.PlaybackStartedEvent) -> None:
+        if not out.first_frame_fut.done():
+            out.first_frame_fut.set_result(ev.created_at)
+
+    try:
+        # Start buffering frames immediately
+        buffer_task = asyncio.create_task(_buffer_frames())
+
+        # Wait for playback delay
+        if playback_delay_remaining > 0:
+            await asyncio.sleep(playback_delay_remaining)
+
+        out.playback_ready_event.set()
+
+        # Check if cancelled during delay
+        if out.cancelled:
+            out.buffer.clear()
+            if buffer_task:
+                buffer_task.cancel()
+                try:
+                    await buffer_task
+                except asyncio.CancelledError:
+                    pass
+            return
+
+        # Start playback
+        audio_output.on("playback_started", _on_playback_started)
+        audio_output.resume()
+
+        # Release buffered frames and continue streaming new ones
+        buffer_idx = 0
+        while buffer_idx < len(out.buffer) or (buffer_task and not buffer_task.done()):
+            if out.cancelled:
+                break
+
+            # Process buffered frames
+            while buffer_idx < len(out.buffer):
+                if out.cancelled:
+                    break
+
+                frame = out.buffer[buffer_idx]
+                buffer_idx += 1
+
+                # Set up resampler if needed
+                if (
+                    not out.first_frame_fut.done()
+                    and audio_output.sample_rate is not None
+                    and frame.sample_rate != audio_output.sample_rate
+                    and resampler is None
+                ):
+                    resampler = rtc.AudioResampler(
+                        input_rate=frame.sample_rate,
+                        output_rate=audio_output.sample_rate,
+                        num_channels=frame.num_channels,
+                    )
+
+                if resampler:
+                    for f in resampler.push(frame):
+                        await audio_output.capture_frame(f)
+                else:
+                    await audio_output.capture_frame(frame)
+
+            # Small yield to allow more frames to buffer
+            if buffer_task and not buffer_task.done() and buffer_idx >= len(out.buffer):
+                await asyncio.sleep(0.01)
+
+        # Flush resampler
+        if resampler and not out.cancelled:
+            for frame in resampler.flush():
+                await audio_output.capture_frame(frame)
+
+    finally:
+        audio_output.off("playback_started", _on_playback_started)
+
+        if buffer_task and not buffer_task.done():
+            buffer_task.cancel()
+            try:
+                await buffer_task
+            except asyncio.CancelledError:
+                pass
+
+        if not out.first_frame_fut.done():
+            out.first_frame_fut.cancel()
+
+        if isinstance(tts_output, _ACloseable):
+            try:
+                await tts_output.aclose()
+            except Exception as e:
+                logger.error("error while closing tts output", exc_info=e)
+
+        audio_output.flush()
+
+
 def perform_audio_forwarding(
     *,
     audio_output: io.AudioOutput,
