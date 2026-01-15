@@ -109,6 +109,7 @@ class _SpeculativeGeneration:
     created_at: float
     end_of_speech_time: float
     buffered_audio: _BufferedAudioOutput | None = None
+    buffered_task: asyncio.Task[None] | None = None
     playback_started: bool = False
 
 
@@ -1445,6 +1446,10 @@ class AgentActivity(RecognitionHooks):
             spec.speech_handle._cancel()
             if spec.buffered_audio is not None:
                 spec.buffered_audio.cancelled = True
+                spec.buffered_audio.cancel_event.set()
+                spec.buffered_audio.playback_ready_event.set()
+            if spec.buffered_task is not None:
+                spec.buffered_task.cancel()
             self._speculative_generation = None
             logger.debug("cancelled speculative generation")
 
@@ -1630,10 +1635,7 @@ class AgentActivity(RecognitionHooks):
                 logger.warning(
                     "speculative generation invalidated: chat context or tools changed"
                 )
-                speculative.speech_handle._cancel()
-                if speculative.buffered_audio is not None:
-                    speculative.buffered_audio.cancelled = True
-                self._speculative_generation = None
+                self._cancel_speculative_generation()
 
         # Then check preemptive generation
         if speech_handle is None and (preemptive := self._preemptive_generation):
@@ -2059,6 +2061,7 @@ class AgentActivity(RecognitionHooks):
                 playback_delay_remaining=playback_delay_remaining,
             )
             speculative.buffered_audio = buffered_out
+            speculative.buffered_task = forward_task
             audio_out = buffered_out
             tasks.append(forward_task)
             audio_out.first_frame_fut.add_done_callback(_on_first_frame)

@@ -345,6 +345,7 @@ class _BufferedAudioOutput:
     buffer: list[rtc.AudioFrame]
     first_frame_fut: asyncio.Future[float]
     playback_ready_event: asyncio.Event
+    cancel_event: asyncio.Event
     cancelled: bool = False
     """Future that will be set with the timestamp of the first frame's capture"""
 
@@ -370,6 +371,7 @@ def perform_buffered_audio_forwarding(
         buffer=[],
         first_frame_fut=asyncio.Future(),
         playback_ready_event=asyncio.Event(),
+        cancel_event=asyncio.Event(),
     )
     task = asyncio.create_task(
         _buffered_audio_forwarding_task(audio_output, tts_output, out, playback_delay_remaining)
@@ -387,6 +389,8 @@ async def _buffered_audio_forwarding_task(
     """Buffer TTS frames and release them after the delay period."""
     resampler: rtc.AudioResampler | None = None
     buffer_task: asyncio.Task[None] | None = None
+    frames_sent = False
+    playback_handler_registered = False
 
     async def _buffer_frames() -> None:
         """Buffer incoming TTS frames until cancelled or stream ends."""
@@ -408,7 +412,12 @@ async def _buffered_audio_forwarding_task(
 
         # Wait for playback delay
         if playback_delay_remaining > 0:
-            await asyncio.sleep(playback_delay_remaining)
+            try:
+                await asyncio.wait_for(
+                    out.cancel_event.wait(), timeout=playback_delay_remaining
+                )
+            except asyncio.TimeoutError:
+                pass
 
         out.playback_ready_event.set()
 
@@ -425,6 +434,7 @@ async def _buffered_audio_forwarding_task(
 
         # Start playback
         audio_output.on("playback_started", _on_playback_started)
+        playback_handler_registered = True
         audio_output.resume()
 
         # Release buffered frames and continue streaming new ones
@@ -456,8 +466,10 @@ async def _buffered_audio_forwarding_task(
 
                 if resampler:
                     for f in resampler.push(frame):
+                        frames_sent = True
                         await audio_output.capture_frame(f)
                 else:
+                    frames_sent = True
                     await audio_output.capture_frame(frame)
 
             # Small yield to allow more frames to buffer
@@ -467,10 +479,12 @@ async def _buffered_audio_forwarding_task(
         # Flush resampler
         if resampler and not out.cancelled:
             for frame in resampler.flush():
+                frames_sent = True
                 await audio_output.capture_frame(frame)
 
     finally:
-        audio_output.off("playback_started", _on_playback_started)
+        if playback_handler_registered:
+            audio_output.off("playback_started", _on_playback_started)
 
         if buffer_task and not buffer_task.done():
             buffer_task.cancel()
@@ -488,7 +502,8 @@ async def _buffered_audio_forwarding_task(
             except Exception as e:
                 logger.error("error while closing tts output", exc_info=e)
 
-        audio_output.flush()
+        if frames_sent:
+            audio_output.flush()
 
 
 def perform_audio_forwarding(
