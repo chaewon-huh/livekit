@@ -1537,6 +1537,8 @@ class AgentActivity(RecognitionHooks):
 
             if self._current_speech:
                 await self._current_speech.interrupt()
+                # Avoid overlapping audio: wait until the interrupted speech fully winds down.
+                await self._current_speech.wait_for_playout()
 
             if self._rt_session is not None:
                 self._rt_session.interrupt()
