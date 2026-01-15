@@ -576,7 +576,7 @@ class AudioRecognition:
             if last_speaking_time:
                 time_offset = last_speaking_time - time.time()
 
-            if speculative_llm_delay is not None and speculative_llm_delay > 0:
+            if speculative_llm_delay is not None and speculative_llm_delay >= 0:
                 # Two-phase delay: speculative trigger at phase 1, end_of_turn at phase 2
                 playback_delay = (
                     tts_playback_delay
