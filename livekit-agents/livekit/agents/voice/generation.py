@@ -355,6 +355,7 @@ def perform_buffered_audio_forwarding(
     audio_output: io.AudioOutput,
     tts_output: AsyncIterable[rtc.AudioFrame],
     playback_delay_remaining: float,
+    playback_gate: asyncio.Event | None = None,
 ) -> tuple[asyncio.Task[None], _BufferedAudioOutput]:
     """Buffer TTS frames and delay playback by specified duration.
 
@@ -374,7 +375,13 @@ def perform_buffered_audio_forwarding(
         cancel_event=asyncio.Event(),
     )
     task = asyncio.create_task(
-        _buffered_audio_forwarding_task(audio_output, tts_output, out, playback_delay_remaining)
+        _buffered_audio_forwarding_task(
+            audio_output,
+            tts_output,
+            out,
+            playback_delay_remaining,
+            playback_gate,
+        )
     )
     return task, out
 
@@ -385,6 +392,7 @@ async def _buffered_audio_forwarding_task(
     tts_output: AsyncIterable[rtc.AudioFrame],
     out: _BufferedAudioOutput,
     playback_delay_remaining: float,
+    playback_gate: asyncio.Event | None,
 ) -> None:
     """Buffer TTS frames and release them after the delay period."""
     resampler: rtc.AudioResampler | None = None
@@ -432,7 +440,12 @@ async def _buffered_audio_forwarding_task(
                     pass
             return
 
-        # Start playback
+        # Start playback (optionally wait until the speech is scheduled)
+        if playback_gate is not None:
+            try:
+                await playback_gate.wait()
+            except asyncio.CancelledError:
+                return
         audio_output.on("playback_started", _on_playback_started)
         playback_handler_registered = True
         audio_output.resume()

@@ -111,6 +111,7 @@ class _SpeculativeGeneration:
     buffered_audio: _BufferedAudioOutput | None = None
     buffered_task: asyncio.Task[None] | None = None
     playback_started: bool = False
+    playback_gate: asyncio.Event | None = None
 
 
 # NOTE: AgentActivity isn't exposed to the public API
@@ -1429,6 +1430,7 @@ class AgentActivity(RecognitionHooks):
             tool_choice=self._tool_choice,
             created_at=time.time(),
             end_of_speech_time=end_of_speech_time,
+            playback_gate=asyncio.Event(),
         )
 
         logger.debug(
@@ -1626,6 +1628,8 @@ class AgentActivity(RecognitionHooks):
 
                 # Schedule the speech - the buffered audio forwarding will handle timing
                 self._schedule_speech(speech_handle, priority=SpeechHandle.SPEECH_PRIORITY_NORMAL)
+                if speculative.playback_gate is not None:
+                    speculative.playback_gate.set()
                 logger.debug(
                     "using speculative generation",
                     extra={"speculative_lead_time": time.time() - speculative.created_at},
@@ -2061,6 +2065,7 @@ class AgentActivity(RecognitionHooks):
                 audio_output=audio_output,
                 tts_output=tts_gen_data.audio_ch,
                 playback_delay_remaining=playback_delay_remaining,
+                playback_gate=speculative.playback_gate,
             )
             speculative.buffered_audio = buffered_out
             speculative.buffered_task = forward_task
